@@ -105,6 +105,8 @@
 #![no_std]
 
 use core::cmp::Ordering;
+#[cfg(feature = "compact")]
+use core::convert::TryFrom;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter;
@@ -186,8 +188,14 @@ pub trait ArenaBehavior {
 }
 
 /// An identifier for an object allocated within an arena.
+///
+/// The opt-in `compact` feature stores the index in a `u32` instead of a
+/// `usize`.
 pub struct Id<T> {
+    #[cfg(not(feature = "compact"))]
     idx: usize,
+    #[cfg(feature = "compact")]
+    idx: u32,
     arena_id: u32,
     _ty: PhantomData<fn() -> T>,
 }
@@ -220,7 +228,7 @@ impl<T> Hash for Id<T> {
     #[inline]
     fn hash<H: Hasher>(&self, h: &mut H) {
         self.arena_id.hash(h);
-        self.idx.hash(h);
+        self.index().hash(h);
     }
 }
 
@@ -242,7 +250,14 @@ impl<T> Id<T> {
     /// Get the index within the arena that this id refers to.
     #[inline]
     pub fn index(&self) -> usize {
-        self.idx
+        #[cfg(feature = "compact")]
+        {
+            self.idx as usize
+        }
+        #[cfg(not(feature = "compact"))]
+        {
+            self.idx
+        }
     }
 }
 
@@ -257,6 +272,8 @@ impl<T> ArenaBehavior for DefaultArenaBehavior<T> {
 
     #[inline]
     fn new_id(arena_id: u32, idx: usize) -> Self::Id {
+        #[cfg(feature = "compact")]
+        let idx = u32::try_from(idx).expect("compact arena index exceeds u32::MAX");
         Id {
             idx,
             arena_id,
@@ -266,7 +283,7 @@ impl<T> ArenaBehavior for DefaultArenaBehavior<T> {
 
     #[inline]
     fn index(id: Self::Id) -> usize {
-        id.idx
+        id.index()
     }
 
     #[inline]
@@ -471,14 +488,14 @@ where
     /// }
     /// ```
     #[inline]
-    pub fn iter(&self) -> Iter<T, A> {
+    pub fn iter(&self) -> Iter<'_, T, A> {
         IntoIterator::into_iter(self)
     }
 
     /// Iterate over this arena's items and their ids, allowing mutation of each
     /// item.
     #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<T, A> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, T, A> {
         IntoIterator::into_iter(self)
     }
 
@@ -722,5 +739,55 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         struct Foo;
         assert_send_sync::<Id<Foo>>();
+    }
+
+    #[test]
+    fn arena_identity_and_iteration_are_preserved() {
+        let mut first = Arena::<usize>::new();
+        let mut second = Arena::<usize>::new();
+        let ids: Vec<_> = (0..1024).map(|value| first.alloc(value)).collect();
+        let other = second.alloc(99);
+        assert_ne!(ids[0], other);
+        assert!(first.get(other).is_none());
+        for ((id, value), expected) in first.iter().zip(0..1024) {
+            assert_eq!(id.index(), expected);
+            assert_eq!(*value, expected);
+            assert_eq!(id, ids[expected]);
+        }
+    }
+
+    #[test]
+    fn maximum_wasm_index_and_hash_input_are_preserved() {
+        let id = DefaultArenaBehavior::<()>::new_id(7, u32::MAX as usize);
+        assert_eq!(id.index(), u32::MAX as usize);
+        #[derive(Default)]
+        struct Bytes(Vec<u8>);
+        impl Hasher for Bytes {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.extend_from_slice(bytes);
+            }
+            fn finish(&self) -> u64 {
+                0
+            }
+        }
+        let mut actual = Bytes::default();
+        id.hash(&mut actual);
+        let mut expected = Bytes::default();
+        7_u32.hash(&mut expected);
+        (u32::MAX as usize).hash(&mut expected);
+        assert_eq!(actual.0, expected.0);
+    }
+
+    #[cfg(feature = "compact")]
+    #[test]
+    fn compact_ids_are_eight_bytes() {
+        assert_eq!(core::mem::size_of::<Id<()>>(), 8);
+    }
+
+    #[cfg(all(feature = "compact", target_pointer_width = "64"))]
+    #[test]
+    #[should_panic(expected = "compact arena index exceeds u32::MAX")]
+    fn oversized_compact_ids_are_rejected() {
+        let _ = DefaultArenaBehavior::<()>::new_id(7, u32::MAX as usize + 1);
     }
 }

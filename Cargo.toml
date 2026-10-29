@@ -17,5 +17,6 @@ features = ['rayon']
 rayon = { version = "1.0.3", optional = true }
 
 [features]
+compact = []
 default = ["std"]
 std = []
